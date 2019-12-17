@@ -110,6 +110,9 @@ struct Config
 	char confineMouse;
 	char noResolutionChange;
 
+	char switchGrabKey1;
+	char switchGrabKey2;
+
 	struct MapConfig *maps;
 };
 
@@ -183,6 +186,9 @@ static void readConfig(const char* fn)
 				config.maps = map;
 			continue;
 		}
+
+		config.switchGrabKey1 = 37;
+		config.switchGrabKey2 = 49;
 
 		#define PARSE_INT(x)						\
 			if (!strcasecmp(buf, #x))				\
@@ -459,6 +465,29 @@ static size_t pad(size_t n)
 	return (n+3) & ~3;
 }
 
+static xGrabPointerReq generateGrabPointerRequest(const Window focus) {
+    xGrabPointerReq req;
+    req.reqType = X_GrabPointer;
+    req.ownerEvents = true; // ?
+    req.length = sizeof(req) / 4;
+    req.grabWindow = focus;
+    req.eventMask = ~0xFFFF8003;
+    req.pointerMode = 1 /* Asynchronous */;
+    req.keyboardMode = 1 /* Asynchronous */;
+    req.confineTo = focus;
+    req.cursor = None;
+    req.time = CurrentTime;
+    return req;
+}
+
+static xResourceReq generateUngrabPointerRequest() {
+    xResourceReq req;
+    req.reqType = X_UngrabPointer;
+    req.length = sizeof(req) / 4;
+    req.id = CurrentTime;
+    return req;
+}
+
 static const char* requestNames[256] =
 {
 	NULL, // 0
@@ -685,6 +714,10 @@ typedef struct
 	Window focus;
 
 	bool blockUngrab;
+	bool holdingMouse;
+
+	bool holdingKey1;
+	bool holdingKey2;
 
 } X11ConnData;
 
@@ -1064,27 +1097,16 @@ static bool handleClientData(X11ConnData* data)
 
     data->skipDelta[sequenceNumber] = data->skipDelta[sequenceNumber - 1];
 
-    data->blockUngrab = true;
-    bool block = data->blockUngrab && req->reqType == 27;
+    bool block = data->holdingMouse && req->reqType == 27;
 
     if (!block) {
 	    if (!sendAll(&conn, data->buf, requestLength)) return false;
 	} else {
         log_debug("   Blocking outgoing request %d\n", sequenceNumber);
 
-        xGrabPointerReq req;
-        req.reqType = X_GrabPointer;
-        req.ownerEvents = true; // ?
-        req.length = sizeof(req) / 4;
-        req.grabWindow = data->focus;
-        req.eventMask = ~0xFFFF8003;
-        req.pointerMode = 1 /* Asynchronous */;
-        req.keyboardMode = 1 /* Asynchronous */;
-        req.confineTo = data->focus;
-        req.cursor = None;
-        req.time = CurrentTime;
+        xGrabPointerReq fakeReq = generateGrabPointerRequest(data->focus);
 
-        if (!sendAll(&conn, &req, sizeof(req))) return false;
+        if (!sendAll(&conn, &fakeReq, sizeof(fakeReq))) return false;
     }
 
 	return true;
@@ -1172,22 +1194,14 @@ static bool handleServerData(X11ConnData* data)
 
                         data->focus = r->focus;
 
-                        xGrabPointerReq req;
-                        req.reqType = X_GrabPointer;
-                        req.ownerEvents = true; // ?
-                        req.length = sizeof(req) / 4;
-                        req.grabWindow = r->focus;
-                        req.eventMask = ~0xFFFF8003;
-                        req.pointerMode = 1 /* Asynchronous */;
-                        req.keyboardMode = 1 /* Asynchronous */;
-                        req.confineTo = r->focus;
-                        req.cursor = None;
-                        req.time = CurrentTime;
+                        if (data->holdingMouse) {
+                            xGrabPointerReq req = generateGrabPointerRequest(r->focus);
 
-                        CARD16 sequenceNumber = injectRequest(data, &req, sizeof(req));
-                        data->notes[sequenceNumber] = Note_X_GrabPointer;
+                            CARD16 sequenceNumber = injectRequest(data, &req, sizeof(req));
+                            data->notes[sequenceNumber] = Note_X_GrabPointer;
 
-                        data->doMouseGrab = false;
+                            data->doMouseGrab = false;
+                        }
                     }
 					break;
 				}
@@ -1384,10 +1398,7 @@ static bool handleServerData(X11ConnData* data)
 			{
 				log_debug("Releasing mouse grab\n");
 
-				xResourceReq req;
-				req.reqType = X_UngrabPointer;
-				req.length = sizeof(req)/4;
-				req.id = CurrentTime;
+				xResourceReq req = generateUngrabPointerRequest();
 				injectRequest(data, &req, sizeof(req));
 
 				data->doMouseGrab = false;
@@ -1403,39 +1414,77 @@ static bool handleServerData(X11ConnData* data)
 		case KeyPress:
 		case KeyRelease:
 		case ButtonPress:
-		case ButtonRelease:
-			if (config.maps)
-			{
-				bool isPress = reply->generic.type == KeyPress || reply->generic.type == ButtonPress;
-				bool isButton = reply->generic.type == ButtonPress || reply->generic.type == ButtonRelease;
-				int kind = isButton ? MAP_KIND_BUTTON : MAP_KIND_KEY;
+        case ButtonRelease: {
+            bool isPress = reply->generic.type == KeyPress || reply->generic.type == ButtonPress;
+            bool isButton = reply->generic.type == ButtonPress || reply->generic.type == ButtonRelease;
+            int kind = isButton ? MAP_KIND_BUTTON : MAP_KIND_KEY;
 
-				bool found = false;
-				for (struct MapConfig *map = config.maps; map; map = map->next)
-					if (map->from.kind == kind && map->from.code == reply->event.u.u.detail)
-					{
-						static const char *kindNames[] = { "key", "button" };
-						log_debug("Mapping %s %u to %s %u\n",
-							kindNames[map->from.kind], map->from.code,
-							kindNames[map->to.kind], map->to.code);
+            bool checkSwitchGrab = false;
 
-						xEvent injected = reply->event;
-						injected.u.u.type = isPress
-							? map->to.kind == MAP_KIND_BUTTON ? ButtonPress : KeyPress
-							: map->to.kind == MAP_KIND_BUTTON ? ButtonRelease : KeyRelease;
-						injected.u.u.detail = map->to.code;
-						injectEvent(data, &injected);
-						found = true;
-					}
+            if (!isButton) {
+                if (reply->event.u.u.detail == config.switchGrabKey1) {
+                    if (isPress) {
+                        data->holdingKey1 = true;
+                        checkSwitchGrab = true;
+                    } else {
+                        data->holdingKey1 = false;
+                    }
+                } else if (reply->event.u.u.detail == config.switchGrabKey2) {
+                    if (isPress) {
+                        data->holdingKey2 = true;
+                        checkSwitchGrab = true;
+                    } else {
+                        data->holdingKey2 = false;
+                    }
+                }
+            }
 
-				if (found)
-				{
-					log_debug("Filtering out mapped input event\n");
-					return true;
-				}
-			}
-			break;
-	}
+            if (checkSwitchGrab && data->holdingKey1 && data->holdingKey2) {
+                if (!data->holdingMouse) {
+                    log_debug("Holding mouse\n");
+                    data->holdingMouse = true;
+                } else {
+                    log_debug("Releasing mouse\n");
+                    data->holdingMouse = false;
+                }
+
+                if (data->holdingMouse) {
+                    if (data->focus) {
+                        xGrabPointerReq req = generateGrabPointerRequest(data->focus);
+                        injectRequest(data, &req, sizeof(req));
+                    }
+                } else {
+                    xResourceReq req = generateUngrabPointerRequest();
+                    injectRequest(data, &req, sizeof(req));
+                }
+            }
+
+            if (config.maps) {
+                bool found = false;
+                for (struct MapConfig *map = config.maps; map; map = map->next)
+                    if (map->from.kind == kind && map->from.code == reply->event.u.u.detail) {
+                        static const char *kindNames[] = {"key", "button"};
+                        log_debug("Mapping %s %u to %s %u\n",
+                                  kindNames[map->from.kind], map->from.code,
+                                  kindNames[map->to.kind], map->to.code);
+
+                        xEvent injected = reply->event;
+                        injected.u.u.type = isPress
+                                            ? map->to.kind == MAP_KIND_BUTTON ? ButtonPress : KeyPress
+                                            : map->to.kind == MAP_KIND_BUTTON ? ButtonRelease : KeyRelease;
+                        injected.u.u.detail = map->to.code;
+                        injectEvent(data, &injected);
+                        found = true;
+                    }
+
+                if (found) {
+                    log_debug("Filtering out mapped input event\n");
+                    return true;
+                }
+            }
+            break;
+        }
+    }
 
 	if (config.debug >= 2 && config.actualX && config.actualY && memmem(data->buf, ofs, &config.actualX, 2) && memmem(data->buf, ofs, &config.actualY, 2))
 		log_debug2("   Found actualW/H in output! ----------------------------------------------------------------------------------------------\n");
