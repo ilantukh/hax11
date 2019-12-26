@@ -12,6 +12,7 @@
 #include <string.h>
 #include <ctype.h>
 #include <sys/stat.h>
+#include <errno.h>
 
 #include <gnu/lib-names.h>
 
@@ -1543,18 +1544,21 @@ static void* workThreadProc(void* dataPtr)
 
 	    if (select(FD_SETSIZE, &readSet, NULL, &errorSet, NULL) < 0)
 	    {
-		    log_error("select() failed");
+	        int errCode = errno;
+		    log_error("select() failed: %s\n", strerror(errCode));
+
+		    if (errCode == 4) continue; // Interrupted system call
 		    break;
 	    }
 
 	    if (FD_ISSET (data->client, &errorSet))
 	    {
-		    log_debug("Error on client socket");
+		    log_debug("Error on client socket\n");
 		    break;
 	    }
 	    if (FD_ISSET (data->server, &errorSet))
 	    {
-		    log_debug("Error on server socket");
+		    log_debug("Error on server socket\n");
 		    break;
 	    }
 
