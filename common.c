@@ -116,11 +116,18 @@ struct Config
 	char switchGrabKey1;
 	char switchGrabKey2;
 
+	unsigned int speedHackMultiplier;
+	unsigned int speedHackDivisor;
+
+	char toggleSpeedHackKey1;
+	char toggleSpeedHackKey2;
+
 	struct MapConfig *maps;
 };
 
 static struct Config config = {};
 static char configLoaded = 0;
+static bool speedHackOn = false;
 
 enum { maxMST = 4 };
 static          int* mstConfigX[maxMST] = { &config.mainX, &config.mst2X, &config.mst3X, &config.mst4X };
@@ -193,6 +200,9 @@ static void readConfig(const char* fn)
 		config.switchGrabKey1 = 37;
 		config.switchGrabKey2 = 49;
 
+		config.toggleSpeedHackKey1 = 37;
+		config.toggleSpeedHackKey2 = 25;
+
 		#define PARSE_INT(x)						\
 			if (!strcasecmp(buf, #x))				\
 				config.x = parseInt(p);				\
@@ -235,6 +245,9 @@ static void readConfig(const char* fn)
 		PARSE_INT(dumb)
 		PARSE_INT(confineMouse)
 		PARSE_INT(noResolutionChange)
+
+		PARSE_INT(speedHackMultiplier)
+		PARSE_INT(speedHackDivisor)
 
 		/* else */
 			log_error("Unknown option: %s\n", buf);
@@ -719,8 +732,11 @@ typedef struct
 	bool blockUngrab;
 	bool holdingMouse;
 
-	bool holdingKey1;
-	bool holdingKey2;
+	bool holdingGrabKey1;
+	bool holdingGrabKey2;
+
+	bool holdingSpeedHackKey1;
+	bool holdingSpeedHackKey2;
 
 } X11ConnData;
 
@@ -1423,26 +1439,43 @@ static bool handleServerData(X11ConnData* data)
             int kind = isButton ? MAP_KIND_BUTTON : MAP_KIND_KEY;
 
             bool checkSwitchGrab = false;
+            bool checkToggleSpeedHack = false;
 
             if (!isButton) {
                 if (reply->event.u.u.detail == config.switchGrabKey1) {
                     if (isPress) {
-                        data->holdingKey1 = true;
+                        data->holdingGrabKey1 = true;
                         checkSwitchGrab = true;
                     } else {
-                        data->holdingKey1 = false;
+                        data->holdingGrabKey1 = false;
                     }
                 } else if (reply->event.u.u.detail == config.switchGrabKey2) {
                     if (isPress) {
-                        data->holdingKey2 = true;
+                        data->holdingGrabKey2 = true;
                         checkSwitchGrab = true;
                     } else {
-                        data->holdingKey2 = false;
+                        data->holdingGrabKey2 = false;
+                    }
+                }
+
+                if (reply->event.u.u.detail == config.toggleSpeedHackKey1) {
+                    if (isPress) {
+                        data->holdingSpeedHackKey1 = true;
+                        checkToggleSpeedHack = true;
+                    } else {
+                        data->holdingSpeedHackKey1 = false;
+                    }
+                } else if (reply->event.u.u.detail == config.toggleSpeedHackKey2) {
+                    if (isPress) {
+                        data->holdingSpeedHackKey2 = true;
+                        checkToggleSpeedHack = true;
+                    } else {
+                        data->holdingSpeedHackKey2 = false;
                     }
                 }
             }
 
-            if (checkSwitchGrab && data->holdingKey1 && data->holdingKey2) {
+            if (checkSwitchGrab && data->holdingGrabKey1 && data->holdingGrabKey2) {
                 if (!data->holdingMouse) {
                     log_debug("Holding mouse\n");
                     data->holdingMouse = true;
@@ -1459,6 +1492,16 @@ static bool handleServerData(X11ConnData* data)
                 } else {
                     xResourceReq req = generateUngrabPointerRequest();
                     injectRequest(data, &req, sizeof(req));
+                }
+            }
+
+            if (checkToggleSpeedHack && data->holdingSpeedHackKey1 && data->holdingSpeedHackKey2) {
+                if (!speedHackOn) {
+                    log_debug("Enabling speedhack\n");
+                    speedHackOn = true;
+                } else {
+                    log_debug("Disabling speedhack\n");
+                    speedHackOn = false;
                 }
             }
 
@@ -1581,4 +1624,131 @@ static void* workThreadProc(void* dataPtr)
 	close(data->client);
 	close(data->server);
 	return NULL;
+}
+
+#include <sys/types.h>
+#include <sys/time.h>
+
+static struct timeval* timezero = 0;
+
+typedef int (*go1)(struct timeval *__restrict tv,
+                   void *__restrict tz);
+
+int gettimeofday (struct timeval *__restrict tv,
+                  void *__restrict tz)
+{
+    // Testing purposes:
+    go1 gettimeofday_orig;
+    int val;
+    gettimeofday_orig=(go1)dlsym(RTLD_NEXT,"gettimeofday");
+    if (!timezero)
+    {
+        timezero = malloc(sizeof(struct timeval));
+        val = gettimeofday_orig(timezero,tz);
+        (*tv) = (*timezero);
+        return val;
+    }
+
+    val = gettimeofday_orig(tv,tz);
+
+    if (!config.enable || !speedHackOn) {
+        return val;
+    }
+
+    unsigned int multiplier = config.speedHackMultiplier;
+    unsigned int divisor = config.speedHackDivisor;
+
+    if (multiplier == 0) multiplier = 1;
+    if (divisor == 0) divisor = 1;
+
+    if (multiplier == 1 && divisor == 1) {
+        return val;
+    }
+
+    int tv_sec_orig = tv->tv_sec;
+    int tv_usec_orig = tv->tv_usec;
+
+    // Multiply the seconds:
+    tv->tv_sec = multiplier * tv->tv_sec - multiplier * timezero->tv_sec + divisor * timezero->tv_sec;
+    // Multiply the microseconds:
+    tv->tv_usec = multiplier * tv->tv_usec - multiplier * timezero->tv_usec + divisor * timezero->tv_usec;
+    // Add the modulus of seconds to microseconds:
+    tv->tv_usec += ((tv->tv_sec % divisor) * 1000000);
+    tv->tv_sec /= divisor;
+    tv->tv_usec /= divisor;
+    while(tv->tv_usec >= 1000000)
+    {
+        tv->tv_usec -= 1000000;
+        tv->tv_sec += 1;
+    }
+    while(tv->tv_usec < 0)
+    {
+        tv->tv_usec += 1000000;
+        tv->tv_sec -= 1;
+    }
+
+    log_debug2("Faking gettimeofday from %d %d to %d %d \n", tv_sec_orig, tv_usec_orig, tv->tv_sec, tv->tv_usec);
+
+    return val;
+}
+
+static struct timespec* timezero2 = 0;
+
+typedef int (*go2)(clockid_t clk_id, struct timespec *tp);
+
+int clock_gettime(clockid_t clk_id, struct timespec *tp) {
+    // Testing purposes:
+    go2 clock_gettime_orig;
+    int val;
+    clock_gettime_orig=(go2)dlsym(RTLD_NEXT, "clock_gettime");
+
+    if (!timezero2)
+    {
+        timezero2 = malloc(sizeof(struct timespec));
+        val = clock_gettime_orig(clk_id, timezero2);
+        (*tp) = (*timezero2);
+        return val;
+    }
+
+    val = clock_gettime_orig(clk_id, tp);
+
+    if (!config.enable || !speedHackOn) {
+        return val;
+    }
+
+    unsigned int multiplier = config.speedHackMultiplier;
+    unsigned int divisor = config.speedHackDivisor;
+
+    if (multiplier == 0) multiplier = 1;
+    if (divisor == 0) divisor = 1;
+
+    if (multiplier == 1 && divisor == 1) {
+        return val;
+    }
+
+    int tv_sec_orig = tp->tv_sec;
+    int tv_nsec_orig = tp->tv_nsec;
+
+    // Multiply the seconds:
+    tp->tv_sec = multiplier * tp->tv_sec - multiplier * timezero2->tv_sec + divisor * timezero2->tv_sec;
+    // Multiply the nanoseconds:
+    tp->tv_nsec = multiplier * tp->tv_nsec - multiplier * timezero2->tv_nsec + divisor * timezero2->tv_nsec;
+    // Add the modulus of seconds to nanoseconds:
+    tp->tv_nsec += ((tp->tv_sec % divisor) * 1000000000);
+    tp->tv_sec /= divisor;
+    tp->tv_nsec /= divisor;
+    while(tp->tv_nsec >= 1000000000)
+    {
+        tp->tv_nsec -= 1000000000;
+        tp->tv_sec += 1;
+    }
+    while(tp->tv_nsec < 0)
+    {
+        tp->tv_nsec += 1000000000;
+        tp->tv_sec -= 1;
+    }
+
+    log_debug2("Faking clock_gettime from %d %d to %d %d \n", tv_sec_orig, tv_nsec_orig, tp->tv_sec, tp->tv_nsec);
+
+    return val;
 }
