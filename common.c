@@ -27,6 +27,8 @@
 
 // ****************************************************************************
 
+#define CARD16_MAX 65536
+
 static void log_error(const char *fmt, ...)
 {
 	va_list args;
@@ -708,7 +710,7 @@ typedef struct
 	CARD16 serial, serialLast, serialDelta;
 	unsigned char skip[1<<16];
 
-	signed char skipDelta[1<<16];
+	unsigned char skipDelta[1<<16];
 
 	/// Whether a mouse-grab is still pending (for the ConfineMouse option)
 	bool doMouseGrab;
@@ -755,7 +757,7 @@ static CARD16 injectRequest(X11ConnData *data, void* buf, size_t size)
 	sendAll(&conn, req, size);
 	CARD16 sequenceNumber = ++data->serial;
 	data->skip[sequenceNumber] = true;
-	data->skipDelta[sequenceNumber] = data->skipDelta[sequenceNumber - 1] + 1;
+	data->skipDelta[sequenceNumber % CARD16_MAX] = data->skipDelta[(sequenceNumber - 1) % CARD16_MAX] + 1;
 	log_debug2("[%d][%d] Injected request %d (%s) with data %d, length %d\n", data->index, sequenceNumber, req->reqType, requestNames[req->reqType], req->data, size);
 	return sequenceNumber;
 }
@@ -1096,7 +1098,7 @@ static bool handleClientData(X11ConnData* data)
 	if (config.debug >= 2 && config.actualX && config.actualY && memmem(data->buf, requestLength, &config.actualX, 2) && memmem(data->buf, requestLength, &config.actualY, 2))
 		log_debug2("   Found actualW/H in input! ----------------------------------------------------------------------------------------------\n");
 
-    data->skipDelta[sequenceNumber] = data->skipDelta[sequenceNumber - 1];
+    data->skipDelta[sequenceNumber] = data->skipDelta[(CARD16) (sequenceNumber - 1)];
 
     bool block = data->holdingMouse && req->reqType == 27;
 
@@ -1508,10 +1510,13 @@ static bool handleServerData(X11ConnData* data)
 		return true;
 	}
 
-	if (reply->generic.sequenceNumber != 0 && data->skipDelta[reply->generic.sequenceNumber] != 0) {
-	    log_debug2("  Faking sequenceNumber from %d to %d\n", reply->generic.sequenceNumber, reply->generic.sequenceNumber - data->skipDelta[reply->generic.sequenceNumber]);
+	if (data->skipDelta[reply->generic.sequenceNumber % CARD16_MAX] != 0) {
+	    CARD16 realSequenceNumber = reply->generic.sequenceNumber;
+        CARD16 fakeSequenceNumber = realSequenceNumber - data->skipDelta[reply->generic.sequenceNumber % CARD16_MAX];
 
-        reply->generic.sequenceNumber -= data->skipDelta[reply->generic.sequenceNumber];
+	    log_debug2("  Faking sequenceNumber from %d to %d\n", realSequenceNumber, fakeSequenceNumber);
+
+	    reply->generic.sequenceNumber = fakeSequenceNumber;
 	}
 
 	if (!sendAll(&conn, data->buf, ofs)) return false;
